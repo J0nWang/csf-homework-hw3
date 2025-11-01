@@ -1,16 +1,16 @@
 /*
- * This program simulates cache behavior with various configurations (LRU for milestone 2)
+ * This program simulates cache behavior with various configurations (LRU and FIFO)
  * CSF Assignment 3: Cache Simulator
  * Jonathan Wang
  * jwang612@jh.edu
  */
 
+#include <cstdint>
+#include <cmath>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <cmath>
-#include <cstdint>
-#include <sstream>
 
 using std::cin;
 using std::cout;
@@ -24,28 +24,31 @@ struct Block {
   bool valid;
   bool dirty;
   uint32_t tag;
-  uint32_t loadTime;
-  
+  // we need to separate arrival and last-access timestamps to distinguish 
+  // between both FIFO (use arrivalTime) and LRU (use lastAccessTime).
+  uint32_t arrivalTime;    // when the block entered the cache (for FIFO)
+  uint32_t lastAccessTime; // time of most recent access (for LRU)
+
   // setting default values
-  Block() : valid(false), dirty(false), tag(0), loadTime(0) {}
+  Block()
+      : valid(false), dirty(false), tag(0), arrivalTime(0), lastAccessTime(0) {}
 };
 
 // struct to represent a cache set
 struct Set {
   vector<Block> blocks;
-  
   Set(int numBlocks) : blocks(numBlocks) {}
 };
 
 // struct to hold cache configuration
 struct CacheConfig {
-  int numSets;
-  int numBlocks;
-  int blockSize;
+  int numSets;      // number of sets
+  int numBlocks;    // blocks per set (associativity)
+  int blockSize;    // bytes per block
   bool writeAllocate;
-  bool writeThrough;
-  bool useLru;  // true for LRU, false for FIFO
-  
+  bool writeThrough; // if false => write-back
+  bool useLru;       // true => LRU, false => FIFO
+
   // calculated values
   int offsetBits;
   int indexBits;
@@ -60,37 +63,42 @@ struct Stats {
   int loadMisses;
   int storeHits;
   int storeMisses;
-  int totalCycles;
-  
-  Stats() : totalLoads(0), totalStores(0), loadHits(0), 
-            loadMisses(0), storeHits(0), storeMisses(0), totalCycles(0) {}
+  long long totalCycles; // can grow large, so using the long long type
+
+  Stats()
+      : totalLoads(0), totalStores(0), loadHits(0), loadMisses(0),
+        storeHits(0), storeMisses(0), totalCycles(0) {}
 };
 
 // helper function declarations
-bool parseArguments(int argc, char **argv, CacheConfig &config);
-bool isPowerOfTwo(int n);
-void simulateCache(const CacheConfig &config, Stats &stats);
-void extractAddressParts(uint32_t address, const CacheConfig &config,
-                         uint32_t &tag, uint32_t &index);
-int findBlock(const Set &set, uint32_t tag);
-int findEvictionBlock(const Set &set, bool useLru);
-void handleLoad(vector<Set> &cache, uint32_t address, 
-                const CacheConfig &config, Stats &stats, uint32_t &globalTime);
-void handleStore(vector<Set> &cache, uint32_t address,
-                 const CacheConfig &config, Stats &stats, uint32_t &globalTime);
+static bool parseArguments(int argc, char **argv, CacheConfig &config);
+static bool isPowerOfTwo(int n);
+static void simulateCache(const CacheConfig &config, Stats &stats);
+static void extractAddressParts(uint32_t address, const CacheConfig &config,
+                                uint32_t &tag, uint32_t &index);
+static int findBlockWithTag(const Set &set, uint32_t tag);
+static int findEvictionBlock(const Set &set, bool useLru);
+static void touchOnHit(Block &blk, bool useLru, uint32_t &globalTime);
+static void installBlock(Block &dst, uint32_t tag, uint32_t &globalTime);
+static void handleLoad(vector<Set> &cache, uint32_t address,
+                       const CacheConfig &config, Stats &stats,
+                       uint32_t &globalTime);
+static void handleStore(vector<Set> &cache, uint32_t address,
+                        const CacheConfig &config, Stats &stats,
+                        uint32_t &globalTime);
 
 int main(int argc, char **argv) {
   CacheConfig config;
-  
+
   // parse command line arguments & check for invalid parameters
   if (!parseArguments(argc, argv, config)) {
     return 1;
   }
-  
+
   // run simulation
   Stats stats;
   simulateCache(config, stats);
-  
+
   // lastly, print results
   cout << "Total loads: " << stats.totalLoads << endl;
   cout << "Total stores: " << stats.totalStores << endl;
@@ -99,42 +107,48 @@ int main(int argc, char **argv) {
   cout << "Store hits: " << stats.storeHits << endl;
   cout << "Store misses: " << stats.storeMisses << endl;
   cout << "Total cycles: " << stats.totalCycles << endl;
-  
   return 0;
 }
 
-// parse and validate command line arguments
-bool parseArguments(int argc, char **argv, CacheConfig &config) {
+// helper functions:
+
+static bool parseArguments(int argc, char **argv, CacheConfig &config) {
   if (argc != 7) {
-    cerr << "Error: Expected 6 arguments" << endl;
+    cerr << "Error: Expected 6 arguments" << endl; // THIS IS DIFFERENT BUT DON"T CHANGE THIS
     cerr << "Usage key: ./csim <sets> <blocks> <bytes> <write-allocate|no-write-allocate> "
          << "<write-through|write-back> <lru|fifo>" << endl;
     return false;
   }
-  
+
   // parse numeric parameters (args 1-3)
-  config.numSets = std::stoi(argv[1]);
-  config.numBlocks = std::stoi(argv[2]);
-  config.blockSize = std::stoi(argv[3]);
-  
-  // validate numeric parameters
+  try {
+    config.numSets = std::stoi(argv[1]);
+    config.numBlocks = std::stoi(argv[2]);
+    config.blockSize = std::stoi(argv[3]);
+  } catch (...) {
+    cerr << "Error: Non-integer numeric parameter in parameters 1-3" << endl;
+    return false;
+  }
+
+  // Validate powers of two and minimum block size
   if (!isPowerOfTwo(config.numSets) || config.numSets <= 0) {
     cerr << "Error: Number of sets must be a positive power of 2" << endl;
     return false;
   }
-  
   if (!isPowerOfTwo(config.numBlocks) || config.numBlocks <= 0) {
     cerr << "Error: Number of blocks must be a positive power of 2" << endl;
     return false;
   }
-  
   if (!isPowerOfTwo(config.blockSize) || config.blockSize < 4) {
     cerr << "Error: Block size must be a power of 2 and at least 4" << endl;
     return false;
   }
-  
-  // parse write-allocate parameter (arg 4)
-  string writeAllocStr = argv[4];
+
+  // parse policy strings
+  const string writeAllocStr = argv[4];
+  const string writeThroughStr = argv[5];
+  const string evictionStr = argv[6];
+
   if (writeAllocStr == "write-allocate") {
     config.writeAllocate = true;
   } else if (writeAllocStr == "no-write-allocate") {
@@ -143,9 +157,7 @@ bool parseArguments(int argc, char **argv, CacheConfig &config) {
     cerr << "Error: Write allocate must be 'write-allocate' or 'no-write-allocate'" << endl;
     return false;
   }
-  
-  // parse write-through parameter (arg 5)
-  string writeThroughStr = argv[5];
+
   if (writeThroughStr == "write-through") {
     config.writeThrough = true;
   } else if (writeThroughStr == "write-back") {
@@ -154,9 +166,7 @@ bool parseArguments(int argc, char **argv, CacheConfig &config) {
     cerr << "Error: Write policy must be 'write-through' or 'write-back'" << endl;
     return false;
   }
-  
-  // chaching strategy (arg 6)
-  string evictionStr = argv[6];
+
   if (evictionStr == "lru") {
     config.useLru = true;
   } else if (evictionStr == "fifo") {
@@ -165,215 +175,224 @@ bool parseArguments(int argc, char **argv, CacheConfig &config) {
     cerr << "Error: Eviction policy must be 'lru' or 'fifo'" << endl;
     return false;
   }
-  
+
   // check for invalid combinations
   if (!config.writeAllocate && !config.writeThrough) {
     cerr << "Error: no-write-allocate cannot be combined with write-back" << endl;
     return false;
   }
-  
+
   // lastly, bit positions
-  config.offsetBits = (int)log2(config.blockSize);
-  config.indexBits = (int)log2(config.numSets);
+  config.offsetBits = (int)std::log2((double)config.blockSize);
+  config.indexBits = (int)std::log2((double)config.numSets);
   config.tagBits = 32 - config.offsetBits - config.indexBits;
-  
+
   return true;
 }
 
 // check if a number is a power of 2 and is positive
-bool isPowerOfTwo(int n) {
+static bool isPowerOfTwo(int n) { 
   return n > 0 && (n & (n - 1)) == 0; 
 }
 
 // get tag and index from address
-void extractAddressParts(uint32_t address, const CacheConfig &config,
-                         uint32_t &tag, uint32_t &index) {
+static void extractAddressParts(uint32_t address, const CacheConfig &config,
+                                uint32_t &tag, uint32_t &index) {
   // remove offset bits
   uint32_t addrWithoutOffset = address >> config.offsetBits;
-  
+
   // extract index
-  uint32_t indexMask = (1U << config.indexBits) - 1;
-  index = addrWithoutOffset & indexMask;
-  
+  uint32_t indexMask = (config.indexBits == 0) ? 0 : ((1u << config.indexBits) - 1u);
+  index = addrWithoutOffset & indexMask; // for fully-associative caches, index==0
+
   // lastly, extract tag
   tag = addrWithoutOffset >> config.indexBits;
 }
 
-// Find valid block with matching tag in a set (-1 if not found)
-int findBlock(const Set &set, uint32_t tag) {
+// find valid block with matching tag in a set (-1 if not found)
+static int findBlockWithTag(const Set &set, uint32_t tag) {
   for (size_t i = 0; i < set.blocks.size(); i++) {
     if (set.blocks[i].valid && set.blocks[i].tag == tag) {
-      return i;
+      return (int)i;  // different, see if this makes any difference (added the (int))
     }
   }
   return -1;
 }
 
-// find block to evict using LRU or FIFO
-int findEvictionBlock(const Set &set, bool useLru) {
-  // first check for invalid blocks
+// choose an invalid block if any, otherwise choose a victim depending on policy
+static int findEvictionBlock(const Set &set, bool useLru) {
   for (size_t i = 0; i < set.blocks.size(); i++) {
     if (!set.blocks[i].valid) {
-      return i;
+      return (int)i;
     }
   }
-  
-  // if all blocks valid, find victim block
+
+  // if all blocks valid, find victim block using
+  // the block with minimum lastAccessTime (LRU)
+  // or minimum arrivalTime (FIFO)
   int victimIndex = 0;
-  uint32_t oldestTime = set.blocks[0].loadTime;
-  
+  uint32_t best = useLru ? set.blocks[0].lastAccessTime : set.blocks[0].arrivalTime;
   for (size_t i = 1; i < set.blocks.size(); i++) {
-    if (set.blocks[i].loadTime < oldestTime) {
-      oldestTime = set.blocks[i].loadTime;
-      victimIndex = i;
+    uint32_t key = useLru ? set.blocks[i].lastAccessTime : set.blocks[i].arrivalTime;
+    if (key < best) {
+      best = key;
+      victimIndex = (int)i;
     }
   }
-  
-  useLru = useLru; // adding this line here to stop the warning message
-  // for MS2 only implementing LRU, so didn't need to use this parameter
   return victimIndex;
 }
 
-// handle a (l)oad operation
-void handleLoad(vector<Set> &cache, uint32_t address, 
-                const CacheConfig &config, Stats &stats, uint32_t &globalTime) {
-  stats.totalLoads++;
-  
-  uint32_t tag, index;
-  extractAddressParts(address, config, tag, index);
-  
-  Set &set = cache[index];
-  int blockIndex = findBlock(set, tag);
-  
-  if (blockIndex != -1) {
-    // then it's a hit
-    stats.loadHits++;
-    stats.totalCycles += 1;
-    
-    // for LRU, update access time for the block
-    if (config.useLru) {
-      set.blocks[blockIndex].loadTime = globalTime++;
-    }
-  } else {
-    // it's a miss
-    stats.loadMisses++;
-    
-    // load from memory (costs 100 cycles per 4-byte block)
-    int blocksToLoad = config.blockSize / 4;
-    stats.totalCycles += 1 + 100 * blocksToLoad;
-    
-    // find block to replace
-    int victimIndex = findEvictionBlock(set, config.useLru);
-    
-    // if evicting dirty block in write-back, write to memory
-    if (set.blocks[victimIndex].valid && set.blocks[victimIndex].dirty) {
-      stats.totalCycles += 100 * blocksToLoad;
-    }
-    
-    // lastly, load the new block into cache
-    set.blocks[victimIndex].valid = true;
-    set.blocks[victimIndex].tag = tag;
-    set.blocks[victimIndex].dirty = false;
-    set.blocks[victimIndex].loadTime = globalTime++;
+// update lastAccessTime if using LRU policy and a cache block is hit
+static void touchOnHit(Block &blk, bool useLru, uint32_t &globalTime) {
+  if (useLru) {
+    blk.lastAccessTime = globalTime++;
   }
 }
 
-// handle a (s)tore operation
-void handleStore(vector<Set> &cache, uint32_t address,
-                 const CacheConfig &config, Stats &stats, uint32_t &globalTime) {
-  stats.totalStores++;
-  
+static void installBlock(Block &dst, uint32_t tag, uint32_t &globalTime) {
+  dst.valid = true;
+  dst.tag = tag;
+  dst.dirty = false;
+  dst.arrivalTime = globalTime;
+  dst.lastAccessTime = globalTime;
+  globalTime++;
+}
+
+// handle a (l)oad operation
+static void handleLoad(vector<Set> &cache, uint32_t address,
+                       const CacheConfig &config, Stats &stats,
+                       uint32_t &globalTime) {
+  stats.totalLoads++;
+
   uint32_t tag, index;
   extractAddressParts(address, config, tag, index);
-  
   Set &set = cache[index];
-  int blockIndex = findBlock(set, tag);
-  
-  if (blockIndex != -1) {
+
+  int i = findBlockWithTag(set, tag);
+  if (i != -1) {
+    // then it's a hit
+    stats.loadHits++;
+    stats.totalCycles += 1;
+    touchOnHit(set.blocks[i], config.useLru, globalTime);
+    return;
+  }
+
+  // it's a miss
+  stats.loadMisses++;
+
+  // load from memory (costs 100 cycles per 4-byte block)
+  int blocksToTransfer = config.blockSize / 4;
+  stats.totalCycles += 1 + 100LL * blocksToTransfer;
+
+  int victim = findEvictionBlock(set, config.useLru);
+  // if evicting dirty block in write-back, write to memory first
+  if (set.blocks[victim].valid && set.blocks[victim].dirty && !config.writeThrough) {
+    stats.totalCycles += 100LL * blocksToTransfer;
+  }
+  installBlock(set.blocks[victim], tag, globalTime);
+}
+
+// handle a (s)tore operation
+static void handleStore(vector<Set> &cache, uint32_t address,
+                        const CacheConfig &config, Stats &stats,
+                        uint32_t &globalTime) {
+  stats.totalStores++;
+
+  uint32_t tag, index;
+  extractAddressParts(address, config, tag, index);
+  Set &set = cache[index];
+
+  int i = findBlockWithTag(set, tag);
+  if (i != -1) {
     // then it's a hit
     stats.storeHits++;
     stats.totalCycles += 1;
-    
-    // for LRU, update access time
-    if (config.useLru) {
-      set.blocks[blockIndex].loadTime = globalTime++;
-    }
-    
+    touchOnHit(set.blocks[i], config.useLru, globalTime);
+
     // handle the write policy
     if (config.writeThrough) {
+      stats.totalCycles += 100; // write to memory immediately
+    } else {
+      set.blocks[i].dirty = true; // write-back: mark dirty
+    }
+    return;
+  }
+
+  // it's a miss
+  stats.storeMisses++;
+
+  if (config.writeAllocate) {
+    // load block into cache
+    int blocksToTransfer = config.blockSize / 4;
+    stats.totalCycles += 1 + 100LL * blocksToTransfer;
+
+    // find block to replace
+    int victim = findEvictionBlock(set, config.useLru);
+
+    // if evicting dirty block in write-back, write to memory
+    if (set.blocks[victim].valid && set.blocks[victim].dirty && !config.writeThrough) {
+      stats.totalCycles += 100LL * blocksToTransfer; // write-back of victim
+    }
+
+    installBlock(set.blocks[victim], tag, globalTime);
+
+    // handle write policy
+    if (config.writeThrough) {
       // if write-through, write to memory
+      set.blocks[victim].dirty = false;
       stats.totalCycles += 100;
     } else {
       // if write-back, mark as dirty
-      set.blocks[blockIndex].dirty = true;
+      set.blocks[victim].dirty = true;
     }
   } else {
-    // it's a miss
-    stats.storeMisses++;
-    
-    if (config.writeAllocate) {
-      // load block into cache
-      int blocksToLoad = config.blockSize / 4;
-      stats.totalCycles += 1 + 100 * blocksToLoad;
-      
-      // find block to replace
-      int victimIndex = findEvictionBlock(set, config.useLru);
-      
-      // if evicting dirty block in write-back, write to memory
-      if (set.blocks[victimIndex].valid && set.blocks[victimIndex].dirty) {
-        stats.totalCycles += 100 * blocksToLoad;
-      }
-      
-      // load the new block into cache
-      set.blocks[victimIndex].valid = true;
-      set.blocks[victimIndex].tag = tag;
-      set.blocks[victimIndex].loadTime = globalTime++;
-      
-      // handle write policy
-      if (config.writeThrough) {
-        // if write-through, write to memory
-        set.blocks[victimIndex].dirty = false;
-        stats.totalCycles += 100;
-      } else {
-        // if write-back, mark as dirty
-        set.blocks[victimIndex].dirty = true;
-      }
-    } else {
-      // if no-write-allocate to begin with, just write to memory
-      stats.totalCycles += 1 + 100;
-    }
+    // if no-write-allocate to begin with, just write to memory
+    stats.totalCycles += 1 + 100;
   }
 }
 
 // main cache simulation function
-void simulateCache(const CacheConfig &config, Stats &stats) {
+static void simulateCache(const CacheConfig &config, Stats &stats) {
   // initiailize cache and global time tracker
   vector<Set> cache;
-  for (int i = 0; i < config.numSets; i++) {
-    cache.push_back(Set(config.numBlocks));
+  cache.reserve(config.numSets);
+  for (int s = 0; s < config.numSets; s++) {
+    cache.emplace_back(config.numBlocks);
   }
+
   uint32_t globalTime = 0;
-  
+
   // read and process the trace file
   string line;
   while (std::getline(cin, line)) {
     if (line.empty()) {
       continue;
     }
-    
+
     std::istringstream iss(line);
     char operation;     // (s)tore or (l)oad
     string addressStr;  // memory address
     int ignored;        // ignoring the third field for this assignement
     
     iss >> operation >> addressStr >> ignored;
-    
+
+    // if there are malformed lines, skip them
+    if (!iss || (operation != 'l' && operation != 's')) {
+      continue;
+    }
+
     // convert address from hex string to uint32_t
-    uint32_t address = std::stoul(addressStr, nullptr, 16);
-    
+    uint32_t address = 0;
+    try {
+      address = static_cast<uint32_t>(std::stoul(addressStr, nullptr, 16));
+    } catch (...) {
+      // again, ignore malformed addresses
+      continue;
+    }
+
     if (operation == 'l') {
       handleLoad(cache, address, config, stats, globalTime);
-    } else if (operation == 's') {
+    } else {
       handleStore(cache, address, config, stats, globalTime);
     }
   }
